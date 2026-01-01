@@ -1,0 +1,16 @@
+[project]
+name = "mj-data"
+version = "0.1.0"
+description = "Smart crop large datasets with multi-GPU support"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gradio>=4.0.0",
+    "transformers>=4.35.0",
+    "torch>=2.0.0",
+    "pillow>=10.0.0",
+    "requests>=2.31.0",
+    "accelerate>=0.25.0",
+    "datasets>=2.14.0",
+    "tqdm>=4.65.0",
+]
