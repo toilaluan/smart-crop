@@ -59,24 +59,44 @@ class SmartImageCropper:
 
         return outputs.pooler_output
 
-    def _compute_features_batch(self, images: List[Image.Image]) -> torch.Tensor:
+    def _compute_features_batch(self, images: List[Image.Image], max_batch_size: int = 32) -> torch.Tensor:
         """
         Compute DINOv2 pooled features for a batch of images.
+        Processes in sub-batches if the batch is too large.
 
         Args:
             images: List of PIL Images
+            max_batch_size: Maximum number of images to process at once (to avoid OOM)
 
         Returns:
             Batched pooled feature tensor of shape (batch_size, feature_dim)
         """
-        inputs = self.processor(images=images, return_tensors="pt").to(
-            self.model.device
-        )
+        if len(images) <= max_batch_size:
+            # Process all at once
+            inputs = self.processor(images=images, return_tensors="pt").to(
+                self.model.device
+            )
 
-        with torch.inference_mode():
-            outputs = self.model(**inputs)
+            with torch.inference_mode():
+                outputs = self.model(**inputs)
 
-        return outputs.pooler_output
+            return outputs.pooler_output
+
+        # Process in sub-batches
+        all_features = []
+        for i in range(0, len(images), max_batch_size):
+            batch_images = images[i:i + max_batch_size]
+            inputs = self.processor(images=batch_images, return_tensors="pt").to(
+                self.model.device
+            )
+
+            with torch.inference_mode():
+                outputs = self.model(**inputs)
+
+            all_features.append(outputs.pooler_output)
+
+        # Concatenate all features
+        return torch.cat(all_features, dim=0)
 
     def _cosine_similarity(self, feat1: torch.Tensor, feat2: torch.Tensor) -> float:
         """
@@ -290,7 +310,7 @@ if __name__ == "__main__":
     from transformers.image_utils import load_image
 
     # Load a test image
-    url = "https://images.pexels.com/photos/3243/pen-calendar-to-do-checklist.jpg?cs=srgb&dl=pexels-breakingpic-3243.jpg&fm=jpg"
+    url = "image.png"
     image = load_image(url)
 
     # Create cropper
