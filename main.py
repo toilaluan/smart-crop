@@ -8,15 +8,18 @@ from accelerate import Accelerator
 from smart_crop import SmartImageCropper
 from tqdm import tqdm
 import argparse
+import torch
+import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
+import numpy as np
 
 
 class CropDataset(Dataset):
     """
-    Dataset that generates original image + all crop candidates for each image.
-    Preprocessing is done in __getitem__ for efficiency.
+    Dataset that generates preprocessed tensors for original image + all crop candidates.
+    All preprocessing is done on tensors for maximum efficiency.
     """
 
     def __init__(
@@ -24,26 +27,36 @@ class CropDataset(Dataset):
         hf_dataset,
         num_crops: int = 16,
         resize_to: int = 1024,
-        processor=None,
+        model_input_size: int = 224,
+        mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
     ):
         """
         Args:
             hf_dataset: HuggingFace dataset with 'image' and 'id' fields
             num_crops: Number of candidate crops to generate per image
             resize_to: Target size for resizing before cropping
-            processor: Image processor for the model
+            model_input_size: Model input size (e.g., 224 for DINOv2)
+            mean: Normalization mean for ImageNet
+            std: Normalization std for ImageNet
         """
         self.hf_dataset = hf_dataset
         self.num_crops = num_crops
         self.resize_to = resize_to
-        self.processor = processor
+        self.model_input_size = model_input_size
+        self.mean = torch.tensor(mean).view(3, 1, 1)
+        self.std = torch.tensor(std).view(3, 1, 1)
 
     def __len__(self):
         return len(self.hf_dataset)
 
-    def _resize_image(self, image: Image.Image) -> Image.Image:
-        """Resize image to target size while maintaining aspect ratio."""
-        width, height = image.size
+    def _pil_to_tensor(self, image: Image.Image) -> torch.Tensor:
+        """Convert PIL image to tensor [C, H, W] in range [0, 1]."""
+        return TF.to_tensor(image)
+
+    def _resize_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Resize tensor to target size while maintaining aspect ratio."""
+        _, height, width = tensor.shape
 
         if width >= height:
             new_height = self.resize_to
@@ -53,16 +66,17 @@ class CropDataset(Dataset):
             new_height = int(height * (self.resize_to / width)) // 16 * 16
 
         if new_width != width or new_height != height:
-            image = image.resize((new_width, new_height), Image.LANCZOS)
+            tensor = TF.resize(tensor, [new_height, new_width], antialias=True)
 
-        return image
+        return tensor
 
-    def _generate_crops(
-        self, image: Image.Image, crop_size: int, num_crops: int
-    ) -> List[Tuple[Image.Image, Tuple[int, int, int, int]]]:
-        """Generate N evenly-spaced crops along the longer dimension."""
-        width, height = image.size
+    def _generate_crop_tensors(
+        self, tensor: torch.Tensor, crop_size: int, num_crops: int
+    ) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, int]]]:
+        """Generate N evenly-spaced crops along the longer dimension as tensors."""
+        _, height, width = tensor.shape
         crops = []
+        boxes = []
 
         if width > height:
             # Crop along width
@@ -76,8 +90,10 @@ class CropDataset(Dataset):
 
             for left in positions:
                 box = (left, 0, left + crop_size, crop_size)
-                cropped = image.crop(box)
-                crops.append((cropped, box))
+                # Tensor crop: [C, H, W] -> crop uses [top:bottom, left:right]
+                cropped = tensor[:, 0:crop_size, left:left + crop_size]
+                crops.append(cropped)
+                boxes.append(box)
         else:
             # Crop along height
             max_top = height - crop_size
@@ -90,21 +106,32 @@ class CropDataset(Dataset):
 
             for top in positions:
                 box = (0, top, crop_size, top + crop_size)
-                cropped = image.crop(box)
-                crops.append((cropped, box))
+                # Tensor crop: [C, H, W] -> crop uses [top:bottom, left:right]
+                cropped = tensor[:, top:top + crop_size, 0:crop_size]
+                crops.append(cropped)
+                boxes.append(box)
 
-        return crops
+        return crops, boxes
+
+    def _normalize_and_resize_for_model(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Resize to model input size and normalize."""
+        # Resize to model input size
+        tensor = TF.resize(tensor, [self.model_input_size, self.model_input_size], antialias=True)
+        # Normalize
+        tensor = (tensor - self.mean) / self.std
+        return tensor
 
     def __getitem__(self, idx):
         """
-        Returns preprocessed tensors for original image + all crops.
+        Returns preprocessed tensors ready for model inference.
 
         Returns:
             dict with:
                 - image_id: str
-                - images: List of PIL Images (original + crops)
-                - crop_boxes: List of crop boxes (None for original, then actual boxes)
+                - tensors: Tensor of shape [num_images, C, H, W] (preprocessed for model)
+                - crop_boxes: List of crop boxes
                 - original_size: Tuple of (width, height)
+                - original_crops: List of original crop tensors (for saving later)
         """
         item = self.hf_dataset[idx]
         image = item["image"]
@@ -115,30 +142,45 @@ class CropDataset(Dataset):
             if image.mode != "RGB":
                 image = image.convert("RGB")
 
+            # Convert to tensor immediately
+            tensor = self._pil_to_tensor(image)  # [C, H, W]
+
             # Resize image
             if self.resize_to is not None:
-                image = self._resize_image(image)
+                tensor = self._resize_tensor(tensor)
 
-            width, height = image.size
+            _, height, width = tensor.shape
 
             # If image is square, just return original
             if width == height:
-                images = [image]
                 crop_boxes = [(0, 0, width, height)]
+                original_crops = [tensor]
+                # Prepare for model
+                model_tensor = self._normalize_and_resize_for_model(tensor).unsqueeze(0)  # [1, C, H, W]
             else:
-                # Generate crops
+                # Generate crops as tensors
                 crop_size = min(width, height)
-                crops = self._generate_crops(image, crop_size, self.num_crops)
+                crop_tensors, crop_boxes_list = self._generate_crop_tensors(
+                    tensor, crop_size, self.num_crops
+                )
 
-                # Prepare list: [original, crop1, crop2, ...]
-                images = [image] + [crop_img for crop_img, _ in crops]
-                crop_boxes = [None] + [box for _, box in crops]
+                # Store original-sized crops for saving later
+                original_crops = [tensor] + crop_tensors
+                crop_boxes = [None] + crop_boxes_list
+
+                # Prepare all tensors for model: [original, crop1, crop2, ...]
+                all_tensors = []
+                for t in original_crops:
+                    all_tensors.append(self._normalize_and_resize_for_model(t))
+
+                model_tensor = torch.stack(all_tensors, dim=0)  # [num_images, C, H, W]
 
             return {
                 "image_id": image_id,
-                "images": images,
+                "tensors": model_tensor,  # Preprocessed for model
                 "crop_boxes": crop_boxes,
                 "original_size": (width, height),
+                "original_crops": original_crops,  # For saving later
                 "success": True,
                 "error": None,
             }
@@ -147,9 +189,10 @@ class CropDataset(Dataset):
             # Return error case
             return {
                 "image_id": image_id,
-                "images": None,
+                "tensors": None,
                 "crop_boxes": None,
                 "original_size": None,
+                "original_crops": None,
                 "success": False,
                 "error": str(e),
             }
@@ -157,17 +200,17 @@ class CropDataset(Dataset):
 
 def collate_fn(batch):
     """
-    Custom collate function that flattens all images from the batch.
+    Custom collate function that concatenates preprocessed tensors.
 
-    Batch contains items, each with (1 original + n_crops) images.
-    We flatten to process all images in one inference pass.
+    Batch contains items, each with preprocessed tensors ready for model.
+    We concatenate them into a single batch tensor.
 
     Returns:
         dict with:
-            - all_images: List of all PIL images to process
+            - model_inputs: Tensor of shape [total_images, C, H, W] ready for model
             - metadata: List of dicts with reconstruction info
     """
-    all_images = []
+    all_tensors = []
     metadata = []
 
     for item in batch:
@@ -179,16 +222,19 @@ def collate_fn(batch):
                     "success": False,
                     "error": item["error"],
                     "num_images": 0,
-                    "start_idx": len(all_images),
+                    "start_idx": 0,
+                    "crop_boxes": None,
+                    "original_size": None,
+                    "original_crops": None,
                 }
             )
             continue
 
-        num_images = len(item["images"])
-        start_idx = len(all_images)
+        num_images = item["tensors"].shape[0]
+        start_idx = sum(m["num_images"] for m in metadata if m["success"])
 
-        # Add all images (original + crops) to the flat list
-        all_images.extend(item["images"])
+        # Add preprocessed tensors to list
+        all_tensors.append(item["tensors"])
 
         # Store metadata for reconstruction
         metadata.append(
@@ -200,28 +246,36 @@ def collate_fn(batch):
                 "start_idx": start_idx,
                 "crop_boxes": item["crop_boxes"],
                 "original_size": item["original_size"],
+                "original_crops": item["original_crops"],
             }
         )
 
-    return {"all_images": all_images, "metadata": metadata}
+    # Concatenate all tensors into single batch
+    if len(all_tensors) > 0:
+        model_inputs = torch.cat(all_tensors, dim=0)  # [total_images, C, H, W]
+    else:
+        model_inputs = None
+
+    return {"model_inputs": model_inputs, "metadata": metadata}
 
 
-def process_batch(batch, cropper):
+def process_batch(batch, cropper, device):
     """
-    Process a batch of images through smart cropping using batched inference.
+    Process a batch of preprocessed tensors through smart cropping.
 
     Args:
-        batch: Batch from DataLoader with flattened images
+        batch: Batch from DataLoader with preprocessed tensors
         cropper: SmartImageCropper instance
+        device: Device to move tensors to
 
     Returns:
         List of dictionaries with results
     """
-    all_images = batch["all_images"]
+    model_inputs = batch["model_inputs"]
     metadata = batch["metadata"]
     results = []
 
-    if len(all_images) == 0:
+    if model_inputs is None or len(metadata) == 0:
         # Only errors in batch
         for meta in metadata:
             results.append(
@@ -229,15 +283,20 @@ def process_batch(batch, cropper):
                     "id": meta["image_id"],
                     "crop_box": None,
                     "similarity": None,
-                    "cropped_image": None,
+                    "cropped_tensor": None,
                     "success": False,
                     "error": meta.get("error", "Unknown error"),
                 }
             )
         return results
 
-    # Compute features for all images at once
-    all_features = cropper._compute_features_batch(all_images)
+    # Move tensors to device and compute features directly (skip processor)
+    model_inputs = model_inputs.to(device)
+
+    with torch.inference_mode():
+        # Direct model inference on preprocessed tensors
+        outputs = cropper.model(pixel_values=model_inputs)
+        all_features = outputs.pooler_output  # [total_images, feature_dim]
 
     # Process each item in the batch
     for meta in metadata:
@@ -247,7 +306,7 @@ def process_batch(batch, cropper):
                     "id": meta["image_id"],
                     "crop_box": None,
                     "similarity": None,
-                    "cropped_image": None,
+                    "cropped_tensor": None,
                     "success": False,
                     "error": meta["error"],
                 }
@@ -257,6 +316,7 @@ def process_batch(batch, cropper):
         start_idx = meta["start_idx"]
         num_images = meta["num_images"]
         crop_boxes = meta["crop_boxes"]
+        original_crops = meta["original_crops"]
 
         # Extract features for this item
         item_features = all_features[start_idx : start_idx + num_images]
@@ -268,7 +328,7 @@ def process_batch(batch, cropper):
                     "id": meta["image_id"],
                     "crop_box": crop_boxes[0],
                     "similarity": 1.0,
-                    "cropped_image": all_images[start_idx],
+                    "cropped_tensor": original_crops[0],
                     "success": True,
                     "error": None,
                 }
@@ -286,14 +346,14 @@ def process_batch(batch, cropper):
         best_idx = similarities.argmax().item()
         best_similarity = similarities[best_idx].item()
         best_box = crop_boxes[best_idx + 1]  # +1 because crop_boxes[0] is None
-        best_crop = all_images[start_idx + 1 + best_idx]  # +1 to skip original
+        best_crop_tensor = original_crops[1 + best_idx]  # +1 to skip original
 
         results.append(
             {
                 "id": meta["image_id"],
                 "crop_box": best_box,
                 "similarity": best_similarity,
-                "cropped_image": best_crop,
+                "cropped_tensor": best_crop_tensor,
                 "success": True,
                 "error": None,
             }
@@ -307,16 +367,21 @@ def save_results(results, output_dir, metadata_file):
     Save cropped images to disk and write metadata.
 
     Args:
-        results: List of result dictionaries
+        results: List of result dictionaries with tensors
         output_dir: Directory to save images
         metadata_file: File handle for writing metadata
     """
     for result in results:
-        if result["success"] and result["cropped_image"] is not None:
+        if result["success"] and result["cropped_tensor"] is not None:
+            # Convert tensor to PIL Image for saving
+            # Tensor is [C, H, W] in range [0, 1]
+            tensor = result["cropped_tensor"]
+            pil_image = TF.to_pil_image(tensor)
+
             # Save image
             image_filename = f"{result['id']}.png"
             image_path = os.path.join(output_dir, image_filename)
-            result["cropped_image"].save(image_path, quality=100)
+            pil_image.save(image_path)
 
             # Write metadata
             metadata_line = (
@@ -450,7 +515,7 @@ def main():
             hf_dataset=subset_ds,
             num_crops=args.num_crops,
             resize_to=args.resize_to,
-            processor=cropper.processor,
+            model_input_size=cropper.processor.size["height"],  # DINOv2 uses 224
         )
 
         # Create DataLoader with custom collate function
@@ -480,7 +545,7 @@ def main():
             # Process batches
             for batch in dataloader:
                 # Process batch with batched inference
-                results = process_batch(batch, cropper)
+                results = process_batch(batch, cropper, accelerator.device)
 
                 # Save results
                 save_results(results, args.output_dir, metadata_file)
