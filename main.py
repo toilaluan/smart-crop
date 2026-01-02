@@ -91,7 +91,7 @@ class CropDataset(Dataset):
             for left in positions:
                 box = (left, 0, left + crop_size, crop_size)
                 # Tensor crop: [C, H, W] -> crop uses [top:bottom, left:right]
-                cropped = tensor[:, 0:crop_size, left:left + crop_size]
+                cropped = tensor[:, 0:crop_size, left : left + crop_size]
                 crops.append(cropped)
                 boxes.append(box)
         else:
@@ -107,7 +107,7 @@ class CropDataset(Dataset):
             for top in positions:
                 box = (0, top, crop_size, top + crop_size)
                 # Tensor crop: [C, H, W] -> crop uses [top:bottom, left:right]
-                cropped = tensor[:, top:top + crop_size, 0:crop_size]
+                cropped = tensor[:, top : top + crop_size, 0:crop_size]
                 crops.append(cropped)
                 boxes.append(box)
 
@@ -116,7 +116,9 @@ class CropDataset(Dataset):
     def _normalize_and_resize_for_model(self, tensor: torch.Tensor) -> torch.Tensor:
         """Resize to model input size and normalize."""
         # Resize to model input size
-        tensor = TF.resize(tensor, [self.model_input_size, self.model_input_size], antialias=True)
+        tensor = TF.resize(
+            tensor, [self.model_input_size, self.model_input_size], antialias=True
+        )
         # Normalize
         tensor = (tensor - self.mean) / self.std
         return tensor
@@ -156,7 +158,9 @@ class CropDataset(Dataset):
                 crop_boxes = [(0, 0, width, height)]
                 original_crops = [tensor]
                 # Prepare for model
-                model_tensor = self._normalize_and_resize_for_model(tensor).unsqueeze(0)  # [1, C, H, W]
+                model_tensor = self._normalize_and_resize_for_model(tensor).unsqueeze(
+                    0
+                )  # [1, C, H, W]
             else:
                 # Generate crops as tensors
                 crop_size = min(width, height)
@@ -478,7 +482,12 @@ def main():
     if accelerator.is_main_process:
         print(f"Loading dataset: {args.dataset} (split: {args.split})")
 
-    ds = load_dataset(args.dataset, split=args.split, num_proc=16)
+    ds = load_dataset(
+        args.dataset,
+        split=args.split,
+        num_proc=16,
+        data_files="data/train-0000*-of-00171.parquet",
+    )
 
     # Select subset if specified
     if args.max_samples is not None:
